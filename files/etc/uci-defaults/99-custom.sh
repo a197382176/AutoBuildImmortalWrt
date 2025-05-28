@@ -1,107 +1,75 @@
 #!/bin/sh
-# 99-custom.sh 就是immortalwrt固件首次启动时运行的脚本 位于固件内的/etc/uci-defaults/99-custom.sh
-# Log file for debugging
+# 99-custom.sh — immortalwrt 首次启动时运行
+env >> /tmp/uci-defaults-env.log
 LOGFILE="/tmp/uci-defaults-log.txt"
 echo "Starting 99-custom.sh at $(date)" >> $LOGFILE
-# 设置默认防火墙规则，方便虚拟机首次访问 WebUI
-uci set firewall.@zone[1].input='ACCEPT'
 
-# 设置主机名映射，解决安卓原生 TV 无法联网的问题
+# 1. 默认防火墙放行规则
+uci set firewall.@zone[1].input='ACCEPT'
+\ n# 2. 主机名映射（解决 Android TV 联网问题）
 uci add dhcp domain
 uci set "dhcp.@domain[-1].name=time.android.com"
 uci set "dhcp.@domain[-1].ip=203.107.6.88"
 
-# 检查配置文件pppoe-settings是否存在 该文件由build.sh动态生成
+# 3. 原有 PPPoE 设置（如果有 /etc/config/pppoe-settings）
 SETTINGS_FILE="/etc/config/pppoe-settings"
-if [ ! -f "$SETTINGS_FILE" ]; then
-    echo "PPPoE settings file not found. Skipping." >> $LOGFILE
+if [ -f "$SETTINGS_FILE" ]; then
+    . "$SETTINGS_FILE"
+    echo "Loaded PPPoE settings." >> $LOGFILE
 else
-   # 读取pppoe信息($enable_pppoe、$pppoe_account、$pppoe_password)
-   . "$SETTINGS_FILE"
+    echo "PPPoE settings file not found; skipping." >> $LOGFILE
 fi
 
-# 计算网卡数量
-count=0
-ifnames=""
-for iface in /sys/class/net/*; do
-  iface_name=$(basename "$iface")
-  # 检查是否为物理网卡（排除回环设备和无线设备）
-  if [ -e "$iface/device" ] && echo "$iface_name" | grep -Eq '^eth|^en'; then
-    count=$((count + 1))
-    ifnames="$ifnames $iface_name"
-  fi
-done
-# 删除多余空格
-ifnames=$(echo "$ifnames" | awk '{$1=$1};1')
+# 4. 网络接口：固定将 eth0 + wlan0 设为 LAN 桥接
+echo "Configuring LAN bridge on eth0 & wlan0" >> $LOGFILE
+uci set network.lan=interface
+uci set network.lan.ifname='eth0 wlan0'
+uci set network.lan.type='bridge'
+uci set network.lan.proto='static'
+uci set network.lan.ipaddr='192.168.100.1'
+uci set network.lan.netmask='255.255.255.0'
 
-# 网络设置
-if [ "$count" -eq 1 ]; then
-   # 单网口设备 类似于NAS模式 动态获取ip模式 具体ip地址取决于上一级路由器给它分配的ip 也方便后续你使用web页面设置旁路由
-   # 单网口设备 不支持修改ip 不要在此处修改ip 
-   uci set network.lan.proto='dhcp'
-elif [ "$count" -gt 1 ]; then
-   # 提取第一个接口作为WAN
-   wan_ifname=$(echo "$ifnames" | awk '{print $1}')
-   # 剩余接口保留给LAN
-   lan_ifnames=$(echo "$ifnames" | cut -d ' ' -f2-)
-   # 设置WAN接口基础配置
-   uci set network.wan=interface
-   # 提取第一个接口作为WAN
-   uci set network.wan.device="$wan_ifname"
-   # WAN接口默认DHCP
-   uci set network.wan.proto='dhcp'
-   # 设置WAN6绑定网口eth0
-   uci set network.wan6=interface
-   uci set network.wan6.device="$wan_ifname"
-   # 更新LAN接口成员
-   # 查找对应设备的section名称
-   section=$(uci show network | awk -F '[.=]' '/\.@?device\[\d+\]\.name=.br-lan.$/ {print $2; exit}')
-   if [ -z "$section" ]; then
-      echo "error：cannot find device 'br-lan'." >> $LOGFILE
-   else
-      # 删除原来的ports列表
-      uci -q delete "network.$section.ports"
-      # 添加新的ports列表
-      for port in $lan_ifnames; do
-         uci add_list "network.$section.ports"="$port"
-      done
-      echo "ports of device 'br-lan' are update." >> $LOGFILE
-   fi
-   # LAN口设置静态IP
-   uci set network.lan.proto='static'
-   # 多网口设备 支持修改为别的ip地址
-   uci set network.lan.ipaddr='192.168.100.1'
-   uci set network.lan.netmask='255.255.255.0'
-   echo "set 192.168.100.1 at $(date)" >> $LOGFILE
-   # 判断是否启用 PPPoE
-   echo "print enable_pppoe value=== $enable_pppoe" >> $LOGFILE
-   if [ "$enable_pppoe" = "yes" ]; then
-      echo "PPPoE is enabled at $(date)" >> $LOGFILE
-      # 设置ipv4宽带拨号信息
-      uci set network.wan.proto='pppoe'
-      uci set network.wan.username=$pppoe_account
-      uci set network.wan.password=$pppoe_password
-      uci set network.wan.peerdns='1'
-      uci set network.wan.auto='1'
-      # 设置ipv6 默认不配置协议
-      uci set network.wan6.proto='none'
-      echo "PPPoE configuration completed successfully." >> $LOGFILE
-   else
-      echo "PPPoE is not enabled. Skipping configuration." >> $LOGFILE
-   fi
-fi
+# 5. DHCP Server 只在 LAN 上开启
+echo "Configuring DHCP on LAN" >> $LOGFILE
+uci set dhcp.lan=dhcp
+uci set dhcp.lan.interface='lan'
+uci set dhcp.lan.start='100'
+uci set dhcp.lan.limit='150'
+uci set dhcp.lan.leasetime='12h'
 
+# 6. 保留原始 WAN 接口设定（不在此脚本内改动 USB Wi-Fi）
+echo "Skipping WAN configuration; will be set later via GUI" >> $LOGFILE
 
-# 设置所有网口可访问网页终端
+# 7. 配置 AP：将 wlan0 设为开放 SSID pi-openwrt
+echo "Configuring wlan0 as open AP with SSID 'pi-openwrt'" >> $LOGFILE
+
+# 确保 radio0 (即 wlan0) 已启用
+uci set wireless.radio0.disabled='0'
+
+# 修改第一条 wifi-iface 为 AP 模式
+uci set wireless.@wifi-iface[0].device='radio0'
+uci set wireless.@wifi-iface[0].mode='ap'
+uci set wireless.@wifi-iface[0].ssid='pi-openwrt'
+uci set wireless.@wifi-iface[0].encryption='none'
+uci set wireless.@wifi-iface[0].network='lan'
+
+# 提交并重载 Wi-Fi
+uci commit wireless
+wifi reload
+
+# 8. 允许所有接口上的 LuCI ttyd 与 Dropbear SSH
 uci delete ttyd.@ttyd[0].interface
-
-# 设置所有网口可连接 SSH
 uci set dropbear.@dropbear[0].Interface=''
-uci commit
 
-# 设置编译作者信息
+# 9. 编译信息标记
 FILE_PATH="/etc/openwrt_release"
 NEW_DESCRIPTION="Compiled by wukongdaily"
 sed -i "s/DISTRIB_DESCRIPTION='[^']*'/DISTRIB_DESCRIPTION='$NEW_DESCRIPTION'/" "$FILE_PATH"
 
+# 10. 提交所有 UCI 更改
+uci commit network\ nuci commit dhcp
+uci commit firewall
+uci commit dropbear
+
+echo "99-custom.sh completed at $(date)" >> $LOGFILE
 exit 0
